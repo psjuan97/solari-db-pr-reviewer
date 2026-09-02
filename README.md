@@ -1,94 +1,157 @@
-# Solari Cookbook
+# solari-db-pr-reviewer — review database PRs on a real, disposable Postgres
 
-Short, runnable examples for [Solari](https://getsolari.com) — cloud browsers,
-sandboxes, and desktops behind one API key.
+Two agents for **database pull requests**:
 
-Every example in this repo is a complete program you can run in under a minute.
-They are deliberately small: one idea each, no framework, no scaffolding to read
-past. Copy one into your project and change the parts you care about.
+- **The reviewer** ([Solari](https://getsolari.com)) — boots a throwaway
+  PostgreSQL in a microVM, loads the branch's base schema, and runs each
+  changed `.sql` file on a fresh fork of it. Reports which files don't finish
+  cleanly, with the exact Postgres error. It only *detects*.
+- **The fixer** ([opencode](https://opencode.ai) GitHub Action) — triggered by
+  a `/oc fix` comment on a failing PR. Reads the reviewer's error, rewrites the
+  broken migration on the PR branch, and pushes a commit. The reviewer then
+  re-runs on that commit and verifies the fix.
 
-## Examples
-
-### Cloud browser
-
-| Example | Language | What it shows |
-| --- | --- | --- |
-| [browser-quickstart-ts](examples/browser-quickstart-ts) | TypeScript | Launch a browser, open a page, read it |
-| [browser-quickstart-py](examples/browser-quickstart-py) | Python | Launch a browser, open a page, read it |
-| [browser-stealth-proxy-ts](examples/browser-stealth-proxy-ts) | TypeScript | Stealth mode + residential proxy egress |
-| [browser-profiles-ts](examples/browser-profiles-ts) | TypeScript | Log in once, reuse the session forever |
-| [browser-session-recording-py](examples/browser-session-recording-py) | Python | Record a session, download the replay |
-
-### Sandbox
-
-| Example | Language | What it shows |
-| --- | --- | --- |
-| [sandbox-quickstart-ts](examples/sandbox-quickstart-ts) | TypeScript | Run a command, write and read files |
-| [sandbox-code-interpreter-py](examples/sandbox-code-interpreter-py) | Python | Stateful Python kernel for agent loops |
-| [sandbox-port-preview-ts](examples/sandbox-port-preview-ts) | TypeScript | Expose a server in the VM on a public URL |
-
-### Desktop
-
-| Example | Language | What it shows |
-| --- | --- | --- |
-| [desktop-computer-use-py](examples/desktop-computer-use-py) | Python | Screenshot, click, and type on a Linux GUI |
-
-## Running an example
-
-Each directory is self-contained.
-
-```bash
-git clone https://github.com/solari-sdk/solari-cookbook.git
-cd solari-cookbook/examples/browser-quickstart-ts
-
-npm install                          # or: pip install -r requirements.txt
-export SOLARI_API_KEY=slr_live_...   # grab one at console.getsolari.com
-npm start                            # or: python main.py
+```
+  PR touches *.sql
+        │
+        ▼
+ ┌──────────────┐   ❌ file X fails:        ┌───────────────┐  pushes fixed X    ┌──────────────┐
+ │  DB PR Review│   "column ... does not   │ opencode agent│  to the PR branch  │  DB PR Review│
+ │  (Solari VM) │──► exist" + the SQL   ──►│  (/oc fix)    │───────────────────►│  re-runs  ✅ │
+ └──────────────┘   posted as a comment    └───────────────┘                    └──────────────┘
+   detect                                    propose                              verify
 ```
 
-One `slr_live_` key works across browsers, sandboxes, and desktops, and every
-product bills to the same balance.
+## Why Solari
 
-## Which product do I want?
+Every PR gets its **own real database** in a microVM that boots in about a
+second and is thrown away after. Untrusted SQL runs with no shared CI database
+to corrupt and nothing to clean up. The one-time `apt-get install postgresql`
+is captured with `sandbox.snapshot()`; from the second run on, the VM boots
+with Postgres already there.
 
-- **Cloud browser** — you need a *web page*: scraping, testing, filling forms,
-  anything Playwright or Puppeteer would do locally. Adds stealth, managed
-  proxies, captcha solving, profiles, and session recording.
-- **Sandbox** — you need to *run code*: an LLM's Python, an untrusted build, a
-  data job. A headless microVM that boots from a snapshot in about a second.
-- **Desktop** — you need a *screen*: computer-use agents, GUI apps, anything
-  that has to be clicked. A sandbox plus X11 and a live VNC stream.
+The check is deliberately simple, and matches what "does this PR work" usually
+means in practice: each file is run with `psql -v ON_ERROR_STOP=1`. **It runs
+cleanly** = every statement finished with no error, under a `statement_timeout`.
+It does not judge query *semantics* — only that it executes and finishes.
 
-## Gotchas the examples encode
+**Snapshot-and-fork.** The base schema — plus an optional `seed.sql` of
+representative data — is loaded **once** into a `base_state` template database.
+Every changed file then runs on a fresh **fork** of it:
 
-Things that cost you an afternoon if you meet them cold:
+```
+createdb --template=base_state review     # ~0.5s, and flat regardless of data size
+```
 
-- **TypeScript: `browser.close()` is enough to exit (as of `@solarisdk/browser`
-  0.1.3).** The client keeps a loopback proxy open for connection retries; before
-  0.1.3 that listener held Node's event loop open, so you had to
-  `await solari.close()` or the script printed its output and then hung forever.
-  0.1.3 unrefs the listener — `browser.close()` alone now exits. Calling
-  `solari.close()` is still fine and releases the client's pool immediately.
-- **Recording is per session, not per account.** Pass `recording: true` when you
-  create the session; without it the replay endpoint 404s forever. The upload is
-  async after release, so poll for ~30s before giving up.
-- **Sandbox commands are not shell-interpreted.** `run("ls -la")` looks for a
-  binary named `ls -la`. Put argv in `args`, or run `sh -c` explicitly.
-- **`kill()`, not `close()`, ends a VM.** `close()` drops your local control
-  channel; the VM keeps running until its idle timeout.
-- **`timeoutMs` is a rolling idle window**, not a hard deadline — it resets on
-  every use.
+`base_state` is never written to, so every check starts from an identical known
+state, and forking stays fast even when that state is a realistic dump rather
+than three empty tables.
 
-## Links
+## Quickstart (local, no GitHub)
 
-- Docs — [docs.getsolari.com](https://docs.getsolari.com)
-- Console — [console.getsolari.com](https://console.getsolari.com)
-- Changelog — [changelog.getsolari.com](https://changelog.getsolari.com)
-- Questions — [hello@getsolari.com](mailto:hello@getsolari.com)
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 
-## Contributing
+cp .env.example .env      # then fill in SOLARI_API_KEY
 
-New examples are welcome. Keep them small, make them run end-to-end against the
-real API, and put anything surprising in a comment right where it bites.
+# review the bundled demo
+python review_pr.py --fixtures fixtures/demo
+```
 
-MIT licensed.
+The demo fixture has one clean migration and two broken ones. Expected output:
+
+```
+## DB PR review — fixture: demo
+
+**❌ some changes fail** · checked on a disposable PostgreSQL in a Solari sandbox
+
+### ✅ `001_add_status_to_orders.sql`
+Runs cleanly.
+
+### ❌ `002_orders_summary_view.sql`
+    ERROR:  column u.name does not exist
+
+### ❌ `003_add_orders_index.sql`
+    ERROR:  column "placed_at" does not exist
+```
+
+The review is also written to `output/<name>-review.md`, and `review_pr.py`
+exits non-zero when any change fails.
+
+### Reviewing a real GitHub PR from the CLI
+
+Needs the [`gh` CLI](https://cli.github.com) and `gh auth login`.
+
+```bash
+python review_pr.py 123 --schema db/schema.sql            # print the review
+python review_pr.py 123 --schema db/schema.sql --comment  # also post it to the PR
+```
+
+`--schema` is the repo path to the base schema file; its merge-base version is
+what the changes run against.
+
+## Wiring it into CI (the two-workflow flow)
+
+| Workflow | Trigger | Does |
+|---|---|---|
+| [`db-review.yml`](.github/workflows/db-review.yml)  | PR touches `**/*.sql` | boots the Solari VM, runs each changed file, comments the result, fails the check if any file errors |
+| [`opencode.yml`](.github/workflows/opencode.yml)    | `/oc fix` comment on a PR | opencode rewrites the failing migration on the PR branch and pushes a commit |
+
+Setup in the repo you want reviewed:
+
+1. Copy `solari_db_review/`, `review_pr.py`, `requirements.txt`, and both
+   workflow files into it.
+2. **Settings → Secrets and variables → Actions → Secrets**: add
+   - `SOLARI_API_KEY` — your Solari key
+   - `OPENCODE_API_KEY` — your opencode.ai subscription key
+3. Edit `db-review.yml`'s `--schema` argument to point at your repo's real base
+   schema file (this repo uses `fixtures/demo/schema.sql`; the default is
+   `schema.sql` at the root).
+4. After the first `db-review` run, its log prints a snapshot id
+   (`tip: save PG_SNAPSHOT_ID=...`). Add it under **Variables** (not Secrets)
+   as `PG_SNAPSHOT_ID` — later runs then skip the ~60s Postgres install.
+5. Open a PR that touches a `.sql` file. If it fails, comment `/oc fix`. When
+   opencode pushes its commit, `db-review` re-runs and (if the fix is good)
+   goes green. A human still reviews and merges.
+
+`db-review.yml` also uploads the Markdown review as a build artifact
+(**Actions → the run → Artifacts → db-review**).
+
+## Repo layout
+
+```
+solari_db_review/
+├── config.py       ReviewSpec, ReviewOptions, StatementResult, ReviewResult (dataclasses)
+├── env.py          tiny .env reader (no dependency)
+├── fetch.py        input → ReviewSpec:  from_fixture(dir)  |  from_pr(url) via gh CLI
+├── sandbox_db.py   boot a Solari sandbox, install+start postgres; load base_state
+│                   once, then fork `review` per changed file
+├── report.py       render Markdown; post_comment() via gh
+└── reviewer.py     orchestrator: for each file → run on a fork → record ok / error
+
+review_pr.py        the CLI
+hello_world.py      SDK smoke test: boot sandbox, start postgres, fork + insert
+fixtures/demo/      schema.sql + seed.sql (optional) + changes/ (one good, two broken)
+.github/workflows/  db-review.yml (detect)  +  opencode.yml (fix)
+```
+
+## What it leans on in the Solari SDK
+
+- **`SandboxClient.create(...)` / `from_snapshot=`** — a microVM per review,
+  optionally booted from a snapshot that already has Postgres.
+- **`sandbox.commands.run("bash", args=[...])`** — install and drive Postgres
+  (`pg_ctlcluster`, `psql`). Commands are not shell-interpreted, so SQL is
+  written to a file with `sandbox.files.write` and run with `psql -f`.
+- **`sandbox.snapshot(name)`** — capture the installed-Postgres VM once so it
+  never has to be installed again.
+- **`sandbox.kill()`** — the review owns exactly one VM and destroys it in a
+  `finally`, never relying on the idle timeout.
+
+Inside that one VM, per-file isolation is Postgres `CREATE DATABASE ...
+TEMPLATE` (a fork of `base_state`), not a fresh sandbox per file — same
+guarantee, ~0.5s, no extra control channels to manage.
+
+## License
+
+MIT
